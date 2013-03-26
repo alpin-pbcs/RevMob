@@ -1,0 +1,206 @@
+<?
+// Fetches your RevMob revenue & impressions statistics so you can update your own local admin reports.
+//
+// author: Jeff Marshall (10coders)
+// contact: jeff@10coders.com
+
+require_once("simple_html_dom.php");
+
+
+// define your console.revmob.com login information here:
+$REVMOB_EMAIL = "you@yourcompany.com";
+$REVMOB_PASSWORD = "yourpassword";
+
+// list out your revmob application ids here.  I group them by project name.
+$REVMOB_APPS = array("game1" => array("ios" => "XXXXXXXXXXXXXXXXXXXXXXXX", "android" => "XXXXXXXXXXXXXXXXXXXXXXXX"),
+                     "game2" => array("ios" => "XXXXXXXXXXXXXXXXXXXXXXXX", "android" => "XXXXXXXXXXXXXXXXXXXXXXXX"),
+                     "game3" => array("ios" => "XXXXXXXXXXXXXXXXXXXXXXXX", "android" => "XXXXXXXXXXXXXXXXXXXXXXXX"));
+
+
+
+class Net {
+  function FetchURL($url, $postargs=array(), $options=array()) {
+    if (!$url) return array();
+    $use_get = array_key_exists('use_get', $options) && $options['use_get'] ? $options['use_get'] : null;
+    $response_headers = array_key_exists('response_headers', $options) ? $options['response_headers'] : false;
+    $cookiefile = array_key_exists('cookiefile', $options) ? $options['cookiefile'] : null;
+
+    $chunks = parse_url($url);
+    $port = array_key_exists('port', $chunks) ? $chunks['port'] : null;
+
+    $ch = curl_init();
+    $qstr = "";
+    if ($use_get && $postargs)
+      $qstr = "?".http_build_query($postargs);
+
+    curl_setopt($ch, CURLOPT_URL,$url.$qstr);
+    if ($port)
+      curl_setopt($ch, CURLOPT_PORT, $port);
+
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+    curl_setopt($ch, CURLOPT_USERAGENT,"Mozilla/4.0");
+    curl_setopt($ch, CURLOPT_AUTOREFERER, true);
+    if ($cookiefile) {
+      curl_setopt($ch, CURLOPT_COOKIEJAR, $cookiefile);
+      curl_setopt($ch, CURLOPT_COOKIEFILE, $cookiefile);
+    }
+    if (!$use_get) {
+      curl_setopt($ch, CURLOPT_POST, 1);
+      curl_setopt($ch, CURLOPT_POSTFIELDS, $postargs);
+    }
+
+    if ($response_headers) {
+      curl_setopt($ch, CURLOPT_HEADER, 1);
+    }
+
+    $data = curl_exec($ch);
+    $info = curl_getinfo($ch);
+    $error = curl_error($ch);
+
+    if ($response_headers) {
+      $header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+      $res['response_headers'] = substr($data, 0, $header_size);
+      $res['data'] = substr($data, $header_size);
+    } else {
+      $res['data'] = $data;
+    }
+    $res['info'] = $info;
+    $res['error'] = $error;
+    return $res;
+  }
+}
+
+
+class RevenueFetcher {
+
+  var $revenues = array();
+
+
+  // grab revenue data from revmob
+  public function grab_revmob() {
+    // step 1: fetch the login page to get our session and the login form's authenticity token
+    // returns: _mobile_ads_session in cookie and authenticity_token in login form
+    global $REVMOB_EMAIL, $REVMOB_PASSWORD;
+    $cookiefile = tempnam("/tmp", "curlcookie");
+    $res = Net::FetchURL("https://console.revmob.com/",
+                         array(),
+                         array("response_headers" => true, "cookiefile" => $cookiefile));
+
+    // parse out authenticity_token
+    // <input name="authenticity_token" type="hidden" value="uFHD/bgBV4J8RiQ/rfa99UXw5+0qn4FH0fsbFkdyV2w=" />
+    $matches = array();
+    $authenticity_token = null;
+    if (preg_match("/<input\s+name=\"authenticity_token\" .*value=\"(.*)\"/", $res['data'], $matches))
+      $authenticity_token = $matches[1];
+
+    if (!$authenticity_token) {
+      print "revmob login: error fetching authenticity_token\n";
+      return;
+    }
+
+    // step 2: log in
+    // requires: email, password
+    // returns: _mobile_ads_session in cookie
+    $res = Net::FetchURL("https://console.revmob.com/users/sessions",
+                         array("email" => $REVMOB_EMAIL, "password" => $REVMOB_PASSWORD,
+                               "authenticity_token" => $authenticity_token,
+                               "utf8" => "&#x2713;",
+                               "commit" => "Login",
+                               "vendor" => ""),
+                         array("cookiefile" => $cookiefile));
+
+    // step 3: fetch revenue by app
+    // requires: app id in URL
+    // returns: javascript table inserted into dom
+    global $REVMOB_APPS, $ENGINE_FILEROOT;
+    foreach ($REVMOB_APPS as $project=>$app_ids) {
+      foreach ($app_ids as $platform=>$app_id) {
+        $res = Net::FetchURL("https://console.revmob.com/mobile_apps/$app_id",
+                             array(),
+                             array("use_get" => true, "cookiefile" => $cookiefile));
+        // pull the revenue table out of the javascript dom append call
+        $data = str_replace("\/", "/", $res['data']);
+
+        $html_start = strpos($data, "$('body').append(\"");
+        $html_end = strpos($data, "\");");
+        if ($html_start === false || $html_end === false) {
+          print "revmob: unknown javascript revenue table format\n";
+          continue;
+        }
+        $revtable = substr($data, $html_start, $html_end - $html_start);
+        $html =  str_get_html($revtable);
+
+        // get headers rows
+        $thead = $html->find('thead', 0);
+        $headers = array();
+        $i = 0;
+        foreach($thead->find('th') as $th) {
+          $headers[strtolower($th->plaintext)] = $i;
+          $i++;
+        }
+
+        // walk the rows of data
+        foreach($html->find('tr') as $tr) {
+          $day = $tr->find('td', $headers["day"]);
+          $impressions = $tr->find('td', $headers["impressions"]);
+          $cpm = $tr->find('td', $headers["ecpm"]);
+          $revenue = $tr->find('td', $headers["revenue"]);
+          if (!$day || !$day->innertext || !$revenue || !$revenue->innertext)
+            continue;
+
+          $day_dt = new DateTime($day->innertext);
+
+          $rev = str_replace(",", "", str_replace("$", "", $revenue->innertext));
+          $impressions = str_replace(",", "", $impressions->innertext);
+          $cpm = str_replace(",", "", str_replace("$", "", $cpm->innertext));
+
+          $this->_add_revenues($project, "revmob", $platform, $rev, $day_dt, $impressions, $cpm);
+        }
+      }
+    }
+  }
+
+
+  // add this bit of revenue to the list of revenue we are tracking
+  protected function _add_revenues($project, $source, $platform, $revenue, $day, $impressions=null, $cpm=null) {
+    $this->revenues[] = array('source' => $source,
+                              'platform' => $platform,
+                              'project' => $project,
+                              'revenue' => $revenue,
+                              'day' => $day,
+                              'impressions' => $impressions,
+                              'cpm' => $cpm);
+  }
+
+
+  // prints the fetched revenue information for debugging
+  public function show() {
+    foreach ($this->revenues as $r)
+      print "Revenue [" . $r['day']->format("Y-m-d") . "] {$r['source']}.{$r['platform']} on {$r['project']}: \$" . number_format($r['revenue'], 2) . "   impressions=" . number_format($r['impressions']) . "\n";
+  }
+
+
+  // exercise for the reader: commit this data to your local admin revenue database
+  public function save() {
+    foreach ($this->revenues as $r) {
+      //$r['source']
+      //$r['platform']
+      //$r['project']
+      //$r['revenue']
+      //$r['day']
+      //$r['impressions']
+      //$r['cpm']
+    }
+  }
+
+}
+
+
+
+// fetch the revenue data
+$fetcher = new RevenueFetcher();
+$fetcher->grab_revmob();
+$fetcher->show();
+$fetcher->save();
